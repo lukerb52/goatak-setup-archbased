@@ -13,7 +13,9 @@
 #   7. optionally opens the firewall (ufw / firewalld)
 #
 # Safe to re-run: existing CA and database are reused, never overwritten.
-# Run as root:  sudo bash goatak-setup.sh
+#
+# Run it as your normal user:  bash goatak-setup.sh
+# Commands that need root go through sudo (or doas), which asks for your password.
 
 set -euo pipefail
 
@@ -94,24 +96,57 @@ json_str() {
     printf '"%s"' "$s"
 }
 
-as_goatak() { runuser -u "$SVC_USER" -- "$@"; }
+# --- privilege helpers ---------------------------------------------------------
+# root:        root CMD...
+# goatak user: as_goatak CMD...
+# goatak user, inside a directory: in_dir DIR CMD...
+root()      { "${ROOT[@]}" "$@"; }
+as_goatak() { "${ROOT[@]}" -u "$SVC_USER" "$@"; }
+# shellcheck disable=SC2016  # $1/$@ are expanded by the inner sh
+in_dir()    { as_goatak sh -c 'cd "$1" || exit 1; shift; exec "$@"' sh "$@"; }
+
+# write stdin to a root-owned file: put_file MODE PATH
+put_file() {
+    local tmpf
+    tmpf=$(mktemp "$TMP/put.XXXXXX")
+    cat >"$tmpf"
+    root install -m "$1" -o root -g root "$tmpf" "$2"
+    rm -f "$tmpf"
+}
 
 # --- preflight -----------------------------------------------------------------
-[[ $EUID -eq 0 ]] || die "run as root (sudo bash $0)"
+[[ $EUID -ne 0 ]] || die "run this as your normal user, not root - it calls sudo itself"
 [[ -x $BIN ]] || die "$BIN not found - install the goatak package first"
 [[ -d $PKG_CERT ]] || die "$PKG_CERT not found - is the goatak package installed?"
-for cmd in openssl zip curl runuser ss install sed; do
+for cmd in openssl curl ss sed mktemp; do
     command -v "$cmd" >/dev/null || die "missing command: $cmd"
 done
+command -v zip >/dev/null || die "missing command: zip (pacman -S zip)"
 
-if ! id "$SVC_USER" >/dev/null 2>&1; then
-    if [[ -f /usr/lib/sysusers.d/goatak.conf ]] && command -v systemd-sysusers >/dev/null; then
-        systemd-sysusers /usr/lib/sysusers.d/goatak.conf
-    else
-        useradd -r -d "$STATE" -s /usr/bin/nologin "$SVC_USER"
-    fi
-    id "$SVC_USER" >/dev/null 2>&1 || die "could not create user $SVC_USER"
+if command -v sudo >/dev/null; then
+    ROOT=(sudo); ROOT_NAME=sudo
+elif command -v doas >/dev/null; then
+    ROOT=(doas); ROOT_NAME=doas
+else
+    die "neither sudo nor doas found"
 fi
+
+# processes started as goatak must not inherit an unreadable working directory
+cd /
+
+TMP=$(mktemp -d)
+chmod 755 "$TMP"
+KEEPALIVE_PID=""
+cleanup() {
+    stop_bootstrap 2>/dev/null || true
+    [[ -n $KEEPALIVE_PID ]] && kill "$KEEPALIVE_PID" 2>/dev/null
+    rm -rf "$TMP"
+}
+stop_bootstrap() {
+    [[ -f $TMP/bootstrap.yml ]] || return 0
+    as_goatak pkill -f -- "-config $TMP/bootstrap.yml" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # init system
 if [[ -d /run/systemd/system ]]; then
@@ -129,13 +164,40 @@ cat <<EOF
 ${c_bold}GoATAK setup${c_off}
 This configures TLS, users and a service for the goatak server.
 Init system detected: ${INIT}
-Press Ctrl+C at any prompt to abort - nothing is changed until you confirm.
+
+Root rights are needed to check the existing state in $STATE and, later,
+to write config, certificates and the service. $ROOT_NAME will ask for your
+password now; the script keeps that session alive until it finishes.
+Nothing is changed until you confirm the summary.
 EOF
+
+step "Authenticating with $ROOT_NAME"
+if [[ $ROOT_NAME == sudo ]]; then
+    sudo -v || die "sudo authentication failed"
+    # refresh sudo's timestamp while we run, so it doesn't ask again mid-way
+    ( while sleep 50; do sudo -n -v 2>/dev/null || exit; done ) &
+    KEEPALIVE_PID=$!
+else
+    doas true || die "doas authentication failed"
+    info "tip: 'permit persist' in /etc/doas.conf avoids repeated password prompts"
+fi
+ok "ok"
+
+if ! id "$SVC_USER" >/dev/null 2>&1; then
+    step "Creating system user $SVC_USER"
+    if [[ -f /usr/lib/sysusers.d/goatak.conf ]] && command -v systemd-sysusers >/dev/null; then
+        root systemd-sysusers /usr/lib/sysusers.d/goatak.conf
+    else
+        root useradd -r -d "$STATE" -s /usr/bin/nologin "$SVC_USER"
+    fi
+    id "$SVC_USER" >/dev/null 2>&1 || die "could not create user $SVC_USER"
+    ok "$SVC_USER"
+fi
 
 # --- questions -----------------------------------------------------------------
 step "Server identity"
 while true; do
-    ask HOST "Hostname phones will connect to (e.g. tak.example.com)" "$(hostname -f 2>/dev/null || hostname)"
+    ask HOST "Hostname phones will connect to (e.g. tak.example.com)" "$(hostname -f 2>/dev/null || cat /etc/hostname 2>/dev/null || true)"
     [[ $HOST =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && break
     warn "letters, digits, dots and dashes only"
 done
@@ -157,7 +219,7 @@ while true; do
 done
 
 REGEN=1
-if [[ -f $CERT_DIR/$HOST.pem && -f $CERT_DIR/$HOST.key ]]; then
+if root test -f "$CERT_DIR/$HOST.pem" && root test -f "$CERT_DIR/$HOST.key"; then
     ask_yn "A server certificate for $HOST already exists. Reuse it?" y && REGEN=0
 fi
 
@@ -176,7 +238,7 @@ fi
 
 step "Accounts"
 FRESH_DB=1
-[[ -f $STATE/db.sqlite ]] && FRESH_DB=0
+root test -f "$STATE/db.sqlite" && FRESH_DB=0
 if (( FRESH_DB )); then
     info "New database: the server creates admin/admin and test/111111 on first start."
     info "This script replaces the admin password and disables 'test'."
@@ -213,9 +275,9 @@ if [[ -n $CUR_ADMIN_PW ]]; then
 fi
 
 FW=none
-if command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+if command -v ufw >/dev/null && root ufw status 2>/dev/null | grep -q "Status: active"; then
     FW=ufw
-elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
+elif command -v firewall-cmd >/dev/null && root firewall-cmd --state >/dev/null 2>&1; then
     FW=firewalld
 fi
 OPEN_FW=0
@@ -243,32 +305,20 @@ info "firewall:        $([[ $OPEN_FW == 1 ]] && echo "open ports in $FW" || echo
 ask_yn "Proceed?" y || die "aborted"
 
 # --- work ----------------------------------------------------------------------
-TMP=$(mktemp -d)
-chmod 755 "$TMP"
-BOOT_PID=""
-cleanup() {
-    if [[ -n $BOOT_PID ]]; then
-        kill "$BOOT_PID" 2>/dev/null || true
-        wait "$BOOT_PID" 2>/dev/null || true
-    fi
-    rm -rf "$TMP"
-}
-trap cleanup EXIT
-
 step "Stopping existing service"
 case $INIT in
-    systemd) systemctl stop goatak.service 2>/dev/null || true ;;
-    runit)   [[ -e $SV_LINK ]] && sv down goatak 2>/dev/null || true ;;
+    systemd) root systemctl stop goatak.service 2>/dev/null || true ;;
+    runit)   if [[ -e $SV_LINK ]]; then root sv down goatak 2>/dev/null || true; fi ;;
 esac
 ok "done"
 
 step "State directory"
-install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$STATE"
-if [[ ! -d $STATE/data ]]; then
-    cp -r "$PKG_DATA" "$STATE/data"
-    chown -R "$SVC_USER:$SVC_USER" "$STATE/data"
+root install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$STATE"
+if ! root test -d "$STATE/data"; then
+    root cp -r "$PKG_DATA" "$STATE/data"
+    root chown -R "$SVC_USER:$SVC_USER" "$STATE/data"
 fi
-install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$CERT_DIR"
+root install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$CERT_DIR"
 # make sure goatak can reach CERT_DIR if it lives outside $STATE
 d=$(dirname "$CERT_DIR")
 while [[ $d != / && $d != "$STATE" ]]; do
@@ -283,35 +333,34 @@ cp "$PKG_CERT"/*.sh "$TMP/"
 sed -i "s/^PASS=.*/PASS='$P12_PASS'/" "$TMP/params.sh"
 chmod 755 "$TMP"/*.sh
 
-cd "$CERT_DIR"
-if [[ -f ca.key ]]; then
+if root test -f "$CERT_DIR/ca.key"; then
+    # refresh the truststore so it matches the chosen password
+    in_dir "$CERT_DIR" openssl pkcs12 -export -nokeys -name ca -in ca.pem -out truststore.p12 -passout "pass:$P12_PASS"
     ok "CA exists, reusing $CERT_DIR/ca.pem"
-    # refresh truststore with the chosen password
-    as_goatak openssl pkcs12 -export -nokeys -name ca -in ca.pem -out truststore.p12 -passout "pass:$P12_PASS"
 else
-    as_goatak "$TMP/make_ca.sh" >/dev/null 2>&1 || die "CA creation failed"
+    in_dir "$CERT_DIR" "$TMP/make_ca.sh" >/dev/null 2>&1 || die "CA creation failed"
     ok "CA created"
 fi
 
 if (( REGEN )); then
-    rm -f "$HOST.pem" "$HOST.key"
+    in_dir "$CERT_DIR" rm -f "$HOST.pem" "$HOST.key"
     # shellcheck disable=SC2086  # EXTRA_SANS is intentionally word-split
-    as_goatak "$TMP/make_server_cert.sh" "$HOST" $EXTRA_SANS >/dev/null 2>&1 || die "server certificate creation failed"
+    in_dir "$CERT_DIR" "$TMP/make_server_cert.sh" "$HOST" $EXTRA_SANS >/dev/null 2>&1 \
+        || die "server certificate creation failed"
     ok "server certificate created for $HOST"
 else
     ok "reusing $HOST.pem"
 fi
-chmod 600 ./*.key
-as_goatak test -r "$HOST.key" || die "goatak cannot read $CERT_DIR/$HOST.key"
-cd - >/dev/null
+in_dir "$CERT_DIR" sh -c 'chmod 600 ./*.key'
+as_goatak test -r "$CERT_DIR/$HOST.key" || die "goatak cannot read $CERT_DIR/$HOST.key"
 
 step "Configuration"
 if [[ -f $CONF ]]; then
-    cp -p "$CONF" "$CONF.bak.$(date +%Y%m%d-%H%M%S)"
+    root cp -p "$CONF" "$CONF.bak.$(date +%Y%m%d-%H%M%S)"
     ok "backup: $CONF.bak.*"
 fi
-install -d -m 755 "$(dirname "$CONF")"
-cat >"$CONF" <<EOF
+root install -d -m 755 "$(dirname "$CONF")"
+put_file 644 "$CONF" <<EOF
 # written by goatak-setup.sh on $(date -Iseconds)
 
 # web GUI / admin API (plain HTTP)
@@ -354,7 +403,6 @@ ssl:
   enroll: true
   cert_ttl_days: 365
 EOF
-chmod 644 "$CONF"
 ok "$CONF"
 
 if (( DO_ACCOUNTS )); then
@@ -371,7 +419,7 @@ tls_addr: ""
 data_dir: $STATE/data
 EOF
     chmod 644 "$TMP/bootstrap.yml"
-    (cd "$STATE" && exec runuser -u "$SVC_USER" -- "$BIN" -config "$TMP/bootstrap.yml") >"$TMP/bootstrap.log" 2>&1 &
+    in_dir "$STATE" "$BIN" -config "$TMP/bootstrap.yml" >"$TMP/bootstrap.log" 2>&1 &
     BOOT_PID=$!
 
     for _ in $(seq 60); do
@@ -405,7 +453,6 @@ EOF
             else warn "could not disable 'test' (HTTP $code)"; fi
         fi
 
-        # admin last: the token stays valid, but do it after everything else anyway
         if [[ -n $NEW_ADMIN_PW ]]; then
             code=$(api PUT /api/device/admin "{\"password\":$(json_str "$NEW_ADMIN_PW"),\"scope\":\"admin\",\"disabled\":false}")
             if [[ $code == 200 ]]; then ok "admin password changed"
@@ -413,15 +460,14 @@ EOF
         fi
     fi
 
-    kill "$BOOT_PID" 2>/dev/null || true
+    stop_bootstrap
     wait "$BOOT_PID" 2>/dev/null || true
-    BOOT_PID=""
 fi
 
 step "Service ($INIT)"
 case $INIT in
 systemd)
-    cat >/etc/systemd/system/goatak.service <<EOF
+    put_file 644 /etc/systemd/system/goatak.service <<EOF
 [Unit]
 Description=GoATAK server
 After=network-online.target
@@ -443,35 +489,34 @@ ReadWritePaths=$STATE
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable goatak.service >/dev/null 2>&1
-    systemctl restart goatak.service
-    LOGCMD="journalctl -u goatak -n 30 --no-pager"
+    root systemctl daemon-reload
+    root systemctl enable goatak.service >/dev/null 2>&1
+    root systemctl restart goatak.service
+    LOGCMD="$ROOT_NAME journalctl -u goatak -n 30 --no-pager"
     ;;
 runit)
-    mkdir -p "$SV_DIR/log"
-    cat >"$SV_DIR/run" <<EOF
+    root mkdir -p "$SV_DIR/log"
+    put_file 755 "$SV_DIR/run" <<EOF
 #!/bin/sh
 exec 2>&1
 cd $STATE || exit 1
 exec chpst -u $SVC_USER:$SVC_USER $BIN -config $CONF
 EOF
-    cat >"$SV_DIR/log/run" <<'EOF'
+    put_file 755 "$SV_DIR/log/run" <<'EOF'
 #!/bin/sh
 install -d -m 750 /var/log/goatak
 exec svlogd -tt /var/log/goatak
 EOF
-    chmod 755 "$SV_DIR/run" "$SV_DIR/log/run"
-    if [[ -e $SV_LINK ]]; then
-        sv restart goatak >/dev/null || true
+    if root test -e "$SV_LINK"; then
+        root sv restart goatak >/dev/null || true
     else
-        ln -s "$SV_DIR" "$SV_LINK"
+        root ln -s "$SV_DIR" "$SV_LINK"
     fi
-    LOGCMD="tail -n 30 /var/log/goatak/current"
+    LOGCMD="$ROOT_NAME tail -n 30 /var/log/goatak/current"
     ;;
 none)
     warn "no systemd or runit found - start it yourself:"
-    info "cd $STATE && runuser -u $SVC_USER -- $BIN -config $CONF"
+    info "cd $STATE && $ROOT_NAME -u $SVC_USER $BIN -config $CONF"
     LOGCMD=""
     ;;
 esac
@@ -490,31 +535,25 @@ if [[ $INIT != none ]]; then
 fi
 
 step "ATAK connection package"
-cd "$CERT_DIR"
-as_goatak cp -f ca.pem ca-trusted.pem
-rm -f "${HOST}_connect.zip"
-as_goatak env SRV_HOST="$HOST" "$TMP/make_connect_dp.sh" >/dev/null 2>&1 || die "data package creation failed"
-ZIP="$CERT_DIR/${HOST}_connect.zip"
+in_dir "$CERT_DIR" cp -f ca.pem ca-trusted.pem
+in_dir "$CERT_DIR" rm -f "${HOST}_connect.zip"
+in_dir "$CERT_DIR" env SRV_HOST="$HOST" "$TMP/make_connect_dp.sh" >/dev/null 2>&1 \
+    || die "data package creation failed"
+ZIP="$HOME/${HOST}_connect.zip"
+# the zip only holds the public CA cert and server address, so it can live in your home
+root cat "$CERT_DIR/${HOST}_connect.zip" >"$ZIP"
+chmod 644 "$ZIP"
 ok "$ZIP"
-if [[ -n ${SUDO_USER-} && $SUDO_USER != root ]]; then
-    home=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-    if [[ -d $home ]]; then
-        install -m 644 -o "$SUDO_USER" "$ZIP" "$home/"
-        ok "copied to $home/${HOST}_connect.zip"
-        ZIP="$home/${HOST}_connect.zip"
-    fi
-fi
-cd - >/dev/null
 
 if (( OPEN_FW )); then
     step "Firewall"
     for p in 8089 8443 8446; do
         case $FW in
-            ufw)       ufw allow "$p/tcp" >/dev/null ;;
-            firewalld) firewall-cmd -q --permanent --add-port="$p/tcp" ;;
+            ufw)       root ufw allow "$p/tcp" >/dev/null ;;
+            firewalld) root firewall-cmd -q --permanent --add-port="$p/tcp" ;;
         esac
     done
-    [[ $FW == firewalld ]] && firewall-cmd -q --reload
+    if [[ $FW == firewalld ]]; then root firewall-cmd -q --reload; fi
     ok "opened 8089, 8443, 8446/tcp"
 fi
 
