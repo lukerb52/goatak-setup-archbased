@@ -223,6 +223,12 @@ if root test -f "$CERT_DIR/$HOST.pem" && root test -f "$CERT_DIR/$HOST.key"; the
     ask_yn "A server certificate for $HOST already exists. Reuse it?" y && REGEN=0
 fi
 
+step "Connection package"
+ask ZIP_DIR "Where should the ATAK connection zip be saved?" "$HOME"
+ZIP_DIR=${ZIP_DIR/#\~/$HOME}
+[[ $ZIP_DIR == /* ]] || die "use an absolute path"
+[[ ! -e $ZIP_DIR || ( -d $ZIP_DIR && -w $ZIP_DIR ) ]] || die "cannot write to $ZIP_DIR"
+
 step "Network"
 if ask_yn "Web GUI (port 8088) on localhost only? (reach it via ssh -L 8088:localhost:8088)" y; then
     ADMIN_ADDR="127.0.0.1:8088"
@@ -290,6 +296,7 @@ fi
 step "Summary"
 info "hostname:        $HOST ${EXTRA_SANS:+(+ $EXTRA_SANS)}"
 info "certificates:    $CERT_DIR ($([[ $REGEN == 1 ]] && echo "new server cert" || echo "reuse server cert"))"
+info "connection zip:  $ZIP_DIR/${HOST}_connect.zip"
 info "config:          $CONF (existing file is backed up)"
 info "web GUI:         $ADMIN_ADDR"
 info "plain CoT 8999:  $([[ $PLAIN_TCP == '""' ]] && echo disabled || echo enabled)"
@@ -539,7 +546,8 @@ in_dir "$CERT_DIR" cp -f ca.pem ca-trusted.pem
 in_dir "$CERT_DIR" rm -f "${HOST}_connect.zip"
 in_dir "$CERT_DIR" env SRV_HOST="$HOST" "$TMP/make_connect_dp.sh" >/dev/null 2>&1 \
     || die "data package creation failed"
-ZIP="$HOME/${HOST}_connect.zip"
+mkdir -p "$ZIP_DIR"
+ZIP="$ZIP_DIR/${HOST}_connect.zip"
 # the zip only holds the public CA cert and server address, so it can live in your home
 root cat "$CERT_DIR/${HOST}_connect.zip" >"$ZIP"
 chmod 644 "$ZIP"
