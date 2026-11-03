@@ -27,6 +27,10 @@ CONF=/etc/goatak/goatak_server.yml
 STATE=/var/lib/goatak
 SVC_USER=goatak
 
+# Server certificate lifetime in days. iOS (13+) rejects TLS server certificates
+# valid for more than 825 days, even from a private CA; the package script uses 3650.
+SRV_DAYS=825
+
 # ports used by the bootstrap instance (localhost only, stopped afterwards)
 BOOT_ADMIN=127.0.0.1:18088
 BOOT_API=127.0.0.1:18080
@@ -218,9 +222,25 @@ while true; do
     warn "use letters, digits and . _ @ % + = , : - only (it is embedded in shell and XML)"
 done
 
-REGEN=1
+REGEN=1; RENEW=0
 if root test -f "$CERT_DIR/$HOST.pem" && root test -f "$CERT_DIR/$HOST.key"; then
-    ask_yn "A server certificate for $HOST already exists. Reuse it?" y && REGEN=0
+    if ask_yn "A server certificate for $HOST already exists. Reuse it?" y; then
+        REGEN=0
+        # Renewing keeps the key: goatak signs enrolled devices' certificates with
+        # it, so a new key would make every enrolled device enroll again.
+        dates=$(root openssl x509 -in "$CERT_DIR/$HOST.pem" -noout -startdate -enddate)
+        not_before=$(date -d "$(sed -n 's/^notBefore=//p' <<<"$dates")" +%s)
+        not_after=$(date -d "$(sed -n 's/^notAfter=//p' <<<"$dates")" +%s)
+        lifetime=$(( (not_after - not_before) / 86400 ))
+        days_left=$(( (not_after - $(date +%s)) / 86400 ))
+        if (( lifetime > SRV_DAYS )); then
+            warn "it is valid for $lifetime days; iOS rejects server certificates valid for more than $SRV_DAYS"
+            ask_yn "Renew it for $SRV_DAYS days with the same key? (enrolled devices keep working)" y && RENEW=1
+        elif (( days_left < 60 )); then
+            warn "it expires in $days_left days"
+            ask_yn "Renew it for $SRV_DAYS days with the same key? (enrolled devices keep working)" y && RENEW=1
+        fi
+    fi
 fi
 
 step "Connection package"
@@ -295,7 +315,10 @@ fi
 # --- summary -------------------------------------------------------------------
 step "Summary"
 info "hostname:        $HOST ${EXTRA_SANS:+(+ $EXTRA_SANS)}"
-info "certificates:    $CERT_DIR ($([[ $REGEN == 1 ]] && echo "new server cert" || echo "reuse server cert"))"
+if (( REGEN )); then cert_action="new server cert, $SRV_DAYS days"
+elif (( RENEW )); then cert_action="renew server cert for $SRV_DAYS days, same key"
+else cert_action="reuse server cert"; fi
+info "certificates:    $CERT_DIR ($cert_action)"
 info "connection zip:  $ZIP_DIR/${HOST}_connect.zip"
 info "config:          $CONF (existing file is backed up)"
 info "web GUI:         $ADMIN_ADDR"
@@ -338,6 +361,9 @@ step "Certificates"
 # private copy of the package scripts with our p12 password (packaged files stay untouched)
 cp "$PKG_CERT"/*.sh "$TMP/"
 sed -i "s/^PASS=.*/PASS='$P12_PASS'/" "$TMP/params.sh"
+sed -i "s/-days 3650/-days $SRV_DAYS/" "$TMP/make_server_cert.sh"
+grep -q -- "-days $SRV_DAYS" "$TMP/make_server_cert.sh" \
+    || die "could not set the server certificate lifetime in $PKG_CERT/make_server_cert.sh (package changed?)"
 chmod 755 "$TMP"/*.sh
 
 if root test -f "$CERT_DIR/ca.key"; then
@@ -354,7 +380,34 @@ if (( REGEN )); then
     # shellcheck disable=SC2086  # EXTRA_SANS is intentionally word-split
     in_dir "$CERT_DIR" "$TMP/make_server_cert.sh" "$HOST" $EXTRA_SANS >/dev/null 2>&1 \
         || die "server certificate creation failed"
-    ok "server certificate created for $HOST"
+    ok "server certificate created for $HOST ($SRV_DAYS days)"
+elif (( RENEW )); then
+    # Same key and subject, new lifetime. Keep the old names and add any new ones.
+    sans=()
+    while read -r san; do
+        [[ -n $san ]] && sans+=("${san/#IP Address:/IP:}")
+    done < <(root openssl x509 -in "$CERT_DIR/$HOST.pem" -noout -ext subjectAltName 2>/dev/null \
+                 | tail -n +2 | tr ',' '\n' | sed 's/^ *//')
+    for n in "$HOST" $EXTRA_SANS; do
+        if [[ $n =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || $n == *:* ]]; then sans+=("IP:$n"); else sans+=("DNS:$n"); fi
+    done
+    san_list=$(printf '%s\n' "${sans[@]}" | awk '!seen[$0]++' | paste -sd, -)
+    printf '%s\n' "basicConstraints=critical,CA:TRUE" \
+        "keyUsage=critical,digitalSignature,keyEncipherment,cRLSign,keyCertSign" \
+        "extendedKeyUsage=critical,clientAuth,serverAuth" \
+        "subjectAltName=$san_list" >"$TMP/renew.ext"
+    chmod 644 "$TMP/renew.ext"
+    in_dir "$CERT_DIR" cp -p "$HOST.pem" "$HOST.pem.bak.$(date +%Y%m%d-%H%M%S)"
+    in_dir "$CERT_DIR" openssl x509 -x509toreq -in "$HOST.pem" -key "$HOST.key" -out renew.csr 2>/dev/null \
+        || die "server certificate renewal failed (request)"
+    in_dir "$CERT_DIR" openssl x509 -req -sha256 -in renew.csr -CA ca.pem -CAkey ca.key -CAcreateserial \
+        -days "$SRV_DAYS" -extfile "$TMP/renew.ext" -out "$HOST.pem.new" 2>/dev/null \
+        || die "server certificate renewal failed (signing)"
+    in_dir "$CERT_DIR" mv -f "$HOST.pem.new" "$HOST.pem"
+    in_dir "$CERT_DIR" rm -f renew.csr
+    # shellcheck disable=SC2016  # $1 is expanded by the inner sh
+    in_dir "$CERT_DIR" sh -c 'cat "$1.pem" ca.pem >"$1-chain.pem"' sh "$HOST"
+    ok "server certificate renewed for $SRV_DAYS days, same key ($san_list)"
 else
     ok "reusing $HOST.pem"
 fi
