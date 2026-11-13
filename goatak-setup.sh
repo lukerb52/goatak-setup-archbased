@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# goatak-setup.sh - interactive first-time deployment of GoATAK (AUR package `goatak`)
+# goatak-setup.sh - AUR GoATAK deployment + trusted HTTPS enrollment proxy
 #
 # What it does:
 #   1. asks for hostname, passwords, users and a few options
@@ -12,9 +12,13 @@
 #   6. builds the ATAK connection data package (<host>_connect.zip)
 #   7. optionally opens the firewall (ufw / firewalld)
 #
-# Safe to re-run: existing CA and database are reused, never overwritten.
+# Existing installations default to a limited enrollment-only repair: certificates,
+# accounts, database, TLS stream and service unit are left untouched.
+# Full setup still overwrites the generated config/service and should be used cautiously.
 #
-# Run it as your normal user:  bash goatak-setup.sh
+# Run as normal user: bash goatak-setup.sh
+# To repair only: bash goatak-setup.sh --enrollment-only
+# To force full setup: bash goatak-setup.sh --full
 # Commands that need root go through sudo (or doas), which asks for your password.
 
 set -euo pipefail
@@ -27,8 +31,9 @@ CONF=/etc/goatak/goatak_server.yml
 STATE=/var/lib/goatak
 SVC_USER=goatak
 
-# Server certificate lifetime in days. iOS (13+) rejects TLS server certificates
-# valid for more than 825 days, even from a private CA; the package script uses 3650.
+# Server certificate lifetime for NEW full installs (not public-WebPKI policy).
+# Certificate-length limits vary by trust model and client; do not automatically
+# replace existing certificates in enrollment-only mode.
 SRV_DAYS=825
 
 # ports used by the bootstrap instance (localhost only, stopped afterwards)
@@ -118,11 +123,401 @@ put_file() {
     rm -f "$tmpf"
 }
 
+# --- HTTPS enrollment proxy support ------------------------------------------
+# Publicly trusted TLS terminates at Nginx on :8446. GoATAK enrollment is
+# plain HTTP on :8447, so remote backends MUST travel over a private secure link
+# (preferably WireGuard), never a public internet port forward.
+ENROLL_MODE=direct
+ENROLL_ADDR=":8446"
+PROXY_IP=""
+PROXY_PEER=""
+PROXY_OUTPUT=""
+PROXY_CERT=""
+PROXY_KEY=""
+NGINX_SITE=/etc/nginx/conf.d/goatak-enrollment.conf
+MODE_ARG=${1:-}
+case "$MODE_ARG" in
+    --help|-h)
+        cat <<'USAGE'
+Usage: bash goatak-setup.sh [--enrollment-only | --full]
+  (default): existing installs offer safe enrollment-only migration
+  --enrollment-only  Change only cert_addr + optionally configure local Nginx
+  --full             Run complete first-time GoATAK setup (overwrites config)
+HTTPS modes: local Nginx, Nginx on another server, or original direct mode.
+Never forward plaintext upstream port 8447 to the public internet.
+USAGE
+        exit 0 ;;
+    --enrollment-only|--full|"") ;;
+    *) die "unknown argument $MODE_ARG (try --help)" ;;
+esac
+
+validate_ip4() {
+    python3 - "$1" <<'PYIP'
+import ipaddress, sys
+try:
+    ip=ipaddress.IPv4Address(sys.argv[1])
+    cgnat = ip in ipaddress.IPv4Network('100.64.0.0/10')
+    assert (ip.is_private or cgnat) and not (ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified or ip.is_reserved)
+except (ValueError, AssertionError):
+    sys.exit(1)
+PYIP
+}
+
+# Nginx config is created unprivileged so the same output works on any distro.
+# Paths to Let's Encrypt certificate files are resolved on the Nginx machine.
+choose_enrollment() {
+    step "Quick Connect / enrollment HTTPS"
+    info "GoATAK's direct :8446 certificate is signed by its private CA."
+    info "For stock iOS Quick Connect choose Nginx with a publicly trusted cert."
+    local choice
+    while true; do
+        ask choice "Proxy: [l]ocal Nginx, [r]emote Nginx, [d]irect private-CA (legacy)" l
+        case ${choice,,} in
+            l|local)  ENROLL_MODE=local;  ENROLL_ADDR="127.0.0.1:8447"; PROXY_IP=127.0.0.1; break ;;
+            r|remote) ENROLL_MODE=remote; break ;;
+            d|direct|none) ENROLL_MODE=direct; ENROLL_ADDR=":8446"; break ;;
+            *) warn "choose local, remote or direct" ;;
+        esac
+    done
+    if [[ $ENROLL_MODE == remote ]]; then
+        info "Use GoATAK's PRIVATE WireGuard/LAN IPv4, not the public IP."
+        command -v ip >/dev/null && ip -br -4 addr show 2>/dev/null | sed -n '1,12p' || true
+        while true; do
+            ask PROXY_IP "GoATAK private IPv4 reachable by remote Nginx" ""
+            validate_ip4 "$PROXY_IP" || { warn "enter a private IPv4 address"; continue; }
+            # Reject typos / addresses not currently assigned to this host.
+            if command -v ip >/dev/null && ! ip -o -4 addr show | grep -Fq "inet $PROXY_IP/"; then
+                warn "$PROXY_IP is not assigned to this machine"; continue
+            fi
+            break
+        done
+        ENROLL_ADDR="$PROXY_IP:8447"
+        while true; do
+            ask PROXY_PEER "Remote Nginx's WireGuard/LAN IPv4 (for firewall instructions)" ""
+            validate_ip4 "$PROXY_PEER" && break
+            warn "enter a private IPv4 address"
+        done
+        warn "HTTP upstream :8447 MUST be limited to the remote Nginx peer over WireGuard/private LAN."
+        warn "Never forward TCP 8447 on your internet router."
+    fi
+    [[ $ENROLL_MODE == direct ]] && return 0
+    PROXY_OUTPUT="$HOME/goatak-enrollment-${HOST}"
+    ask PROXY_OUTPUT "Where should Nginx config/instructions be saved?" "$PROXY_OUTPUT"
+    [[ $PROXY_OUTPUT == /* ]] || die "proxy output path must be absolute"
+    local defcert="/etc/letsencrypt/live/$HOST/fullchain.pem"
+    local defkey="/etc/letsencrypt/live/$HOST/privkey.pem"
+    info "These PEM paths are on the NGINX computer (not necessarily GoATAK)."
+    ask PROXY_CERT "Nginx full-chain certificate path" "$defcert"
+    ask PROXY_KEY "Nginx private-key path" "$defkey"
+    [[ $PROXY_CERT == /* && $PROXY_KEY == /* && $PROXY_CERT != *[[:space:]]* && $PROXY_KEY != *[[:space:]]* ]] || die "certificate paths must be absolute and have no whitespace"
+}
+
+make_proxy_files() {
+    [[ $ENROLL_MODE == direct ]] && return 0
+    mkdir -p "$PROXY_OUTPUT"
+    [[ -w $PROXY_OUTPUT ]] || die "cannot write $PROXY_OUTPUT"
+    cat >"$PROXY_OUTPUT/goatak-enrollment.conf" <<EOFNG
+# GoATAK Quick Connect HTTPS enrollment. Install inside nginx http{}.
+# Generated for $HOST; private GoATAK upstream is $PROXY_IP:8447.
+server {
+    listen 8446 ssl;
+    server_name $HOST;
+    ssl_certificate $PROXY_CERT;
+    ssl_certificate_key $PROXY_KEY;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 16m;
+
+    location / {
+        proxy_pass http://$PROXY_IP:8447;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_connect_timeout 10s;
+        proxy_read_timeout 60s;
+    }
+}
+EOFNG
+    cat >"$PROXY_OUTPUT/README.txt" <<EOFRD
+GoATAK HTTPS enrollment proxy
+=============================
+Host shown to phones: $HOST
+Nginx installation: $ENROLL_MODE
+GoATAK enrollment backend: $ENROLL_ADDR (HTTP on port 8447)
+Public/phone-facing HTTPS: $HOST:8446 (Nginx)
+Encrypted TAK client stream: $HOST:8089 (GoATAK; unchanged)
+
+1. Acquire a PUBLICLY TRUSTED TLS full chain and key for $HOST on the
+   Nginx computer. The configured paths are:
+   $PROXY_CERT
+   $PROXY_KEY
+   Let's Encrypt with DNS-01 works without inbound port 80; choose your DNS
+   provider's certbot DNS plugin (or another ACME client). Arrange automatic
+   renewal AND Nginx reload. Do not copy the GoATAK private CA key here.
+2. Install goatak-enrollment.conf into an
+   included Nginx http{} conf directory, typically /etc/nginx/conf.d/.
+   Example, on the Nginx host:
+      sudo install -m 644 goatak-enrollment.conf /etc/nginx/conf.d/goatak-enrollment.conf
+      sudo nginx -t
+      sudo systemctl reload nginx    # or start nginx if not running
+3. Check from a machine that reaches the Nginx listener:
+      openssl s_client -connect $HOST:8446 -servername $HOST \\
+        -verify_hostname $HOST -verify_return_error </dev/null 2>&1 \\
+        | grep -E 'Verification:|Verify return code:|verify error:'
+   Success: Verify return code: 0 (ok), WITHOUT -CAfile.
+4. Add an OmniTAK iOS Quick Connect to $HOST (server 8089, enroll 8446).
+
+NETWORK / WIREGUARD
+- Do not forward 8447 on your WAN/router.
+- Existing WireGuard UDP forwarding need not be changed.
+- iOS clients must reach Nginx TCP 8446 and GoATAK TCP 8089.
+- $([[ $ENROLL_MODE == remote ]] && echo "Remote Nginx must reach GoATAK $PROXY_IP:8447; allow ONLY $PROXY_PEER as source, preferably restricted to wg0." || echo "Local Nginx reaches 127.0.0.1:8447; never open 8447 in the firewall.")
+- DNS for $HOST must point/routably resolve to the Nginx machine for 8446,
+  and to GoATAK for 8089. If they are separate machines, use appropriate
+  port-specific routing/NAT, distinct internal routing, or a front-end TCP
+  proxy for 8089. DNS alone cannot send different ports to different servers.
+- The optional file OPTIONAL-stream-8089.conf is an Nginx stream{} snippet for
+  raw TCP pass-through of :8089 to GoATAK (requires Nginx stream module). ONLY
+  use it if the clients connect to Nginx for both :8446 and :8089; do not
+  install it into http{} or enable it if existing 8089 routing already works.
+- When both hosts are on WireGuard, use suitable routes/port forwards between
+  Nginx and GoATAK and ensure both can communicate across the VPN.
+$([[ $ENROLL_MODE == remote ]] && echo "- UFW example on GoATAK, assuming wg0: sudo ufw allow in on wg0 from $PROXY_PEER to $PROXY_IP port 8447 proto tcp" || echo "- No firewall port for 8447 is needed with local loopback Nginx.")
+- Do not expose GoATAK's admin HTTP API or enrollment HTTP backend publicly.
+EOFRD
+    if [[ $ENROLL_MODE == remote ]]; then
+        cat >"$PROXY_OUTPUT/OPTIONAL-stream-8089.conf" <<EOFSTREAM
+# OPTIONAL only when client DNS points to Nginx and :8089 needs forwarding.
+# This file belongs inside Nginx's STREAM context, NOT its HTTP context.
+# The Nginx stream module must be installed/enabled on the Nginx computer.
+server {
+    listen 8089;
+    proxy_connect_timeout 10s;
+    proxy_timeout 1h;
+    proxy_pass $PROXY_IP:8089;
+}
+EOFSTREAM
+    fi
+    ok "Nginx site and notes generated at $PROXY_OUTPUT/"
+}
+
+# Test certificate on LOCAL nginx computer before touching an existing GoATAK.
+local_cert_ready() {
+    command -v nginx >/dev/null || { warn "nginx not installed on this GoATAK host"; return 1; }
+    root test -r "$PROXY_CERT" && root test -r "$PROXY_KEY" || {
+        warn "Nginx certificate/key not found. Acquire a public-trust certificate first."
+        return 1
+    }
+    root openssl x509 -in "$PROXY_CERT" -noout -checkend 86400 >/dev/null 2>&1 || {
+        warn "Nginx certificate invalid or expires in less than 24 hours"; return 1;
+    }
+    root openssl x509 -in "$PROXY_CERT" -noout -checkhost "$HOST" 2>/dev/null | grep -Eqi 'does match|does match certificate' || {
+        warn "Nginx certificate does not match $HOST"; return 1;
+    }
+    local cert_pub key_pub
+    cert_pub=$(root openssl x509 -in "$PROXY_CERT" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | openssl dgst -sha256) || return 1
+    key_pub=$(root openssl pkey -in "$PROXY_KEY" -pubout -outform DER 2>/dev/null | openssl dgst -sha256) || return 1
+    [[ $cert_pub == "$key_pub" && -n $cert_pub ]] || {
+        warn "Nginx certificate and private key do not match"; return 1;
+    }
+    # An unknown/private CA is not the intended Quick Connect fix.
+    if ! root openssl verify -CApath /etc/ssl/certs -untrusted "$PROXY_CERT" "$PROXY_CERT" >/dev/null 2>&1; then
+        warn "Nginx certificate does NOT validate against this host's public/system CAs."
+        warn "Use a trusted CA full chain (e.g. Let's Encrypt), not GoATAK's private CA."
+        return 1
+    fi
+    # Nginx might be configured differently; ensure the include directory is active.
+    root nginx -T 2>&1 | grep -Eq '^[[:space:]]*include[[:space:]]+/etc/nginx/conf\.d/\*\.conf;' || {
+        warn "Nginx may not include /etc/nginx/conf.d/*.conf; configure your http{} include first."
+        return 1
+    }
+}
+
+backup_conf() {
+    BACKUP_CONF="${CONF}.bak.$(date +%Y%m%d-%H%M%S).$$"
+    root cp -p "$CONF" "$BACKUP_CONF"
+    ok "config backup: $BACKUP_CONF"
+}
+
+# Changes ONLY the top-level cert_addr line; every other setting is preserved.
+patch_enrollment_config() {
+    root python3 - "$CONF" "$ENROLL_ADDR" <<'PYPATCH'
+from pathlib import Path
+import os, re, sys, tempfile
+path, addr = Path(sys.argv[1]), sys.argv[2]
+if not re.fullmatch(r'(?:(?:127\.0\.0\.1|[0-9]{1,3}(?:\.[0-9]{1,3}){3}):8447|:8446)',addr):
+    raise SystemExit('refusing unsafe cert_addr')
+src=path.read_text()
+pattern=re.compile(r'^(cert_addr\s*:\s*)([^\n]*)(\n?)$',re.M)
+items=list(pattern.finditer(src))
+if len(items)>1: raise SystemExit('multiple top-level cert_addr keys; manual review needed')
+if items:
+    a=items[0]
+    new=src[:a.start()]+a.group(1)+'"'+addr+'"'+a.group(3)+src[a.end():]
+else:
+    new=src.rstrip('\n')+'\ncert_addr: "'+addr+'"\n'
+if new==src: sys.exit(0)
+st=os.stat(path)
+fd, name=tempfile.mkstemp(prefix='.goatak-',dir=str(path.parent))
+try:
+    os.fchmod(fd, st.st_mode & 0o777)
+    os.fchown(fd,st.st_uid,st.st_gid)
+    with os.fdopen(fd,'w') as f:
+        f.write(new); f.flush(); os.fsync(f.fileno())
+    os.replace(name,path)
+except BaseException:
+    try: os.unlink(name)
+    except OSError: pass
+    raise
+PYPATCH
+}
+
+restart_running_goatak() {
+    if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
+        root systemctl restart goatak.service && root systemctl is-active --quiet goatak.service
+    elif command -v sv >/dev/null; then
+        root sv restart goatak
+    else
+        warn "no supported init manager detected; restart GoATAK manually"
+        return 1
+    fi
+}
+
+wait_for_goatak() {
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if ss -ltnH 'sport = :8089' 2>/dev/null | grep -q . && \
+           ss -ltnH 'sport = :8447' 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        sleep 1
+    done
+    warn "GoATAK did not open both :8089 and :8447 after restart"
+    return 1
+}
+
+# Install or replace only this dedicated Nginx site; roll it back if nginx -t fails.
+install_local_site() {
+    local site_backup="" site_appeared=0
+    if root test -e "$NGINX_SITE"; then
+        site_backup="${NGINX_SITE}.bak.$(date +%Y%m%d-%H%M%S).$$"
+        root cp -p "$NGINX_SITE" "$site_backup"
+    else
+        site_appeared=1
+    fi
+    root install -d -m 755 "$(dirname "$NGINX_SITE")"
+    root install -m 644 "$PROXY_OUTPUT/goatak-enrollment.conf" "$NGINX_SITE"
+    if ! root nginx -t; then
+        if [[ -n $site_backup ]]; then root cp -p "$site_backup" "$NGINX_SITE"; else root rm -f "$NGINX_SITE"; fi
+        die "Nginx config validation failed; restored Nginx config, GoATAK unchanged"
+    fi
+    NGINX_BACKUP="$site_backup"
+    NGINX_NEW="$site_appeared"
+}
+
+rollback_local_site() {
+    if [[ -n ${NGINX_BACKUP:-} ]]; then
+        root cp -p "$NGINX_BACKUP" "$NGINX_SITE"
+    elif [[ ${NGINX_NEW:-0} == 1 ]]; then
+        root rm -f "$NGINX_SITE"
+    fi
+    root nginx -t >/dev/null 2>&1 && root systemctl reload nginx 2>/dev/null || true
+}
+
+run_enrollment_only() {
+    root test -f "$CONF" || die "not found: $CONF (run --full to install first)"
+    step "Enrollment-only repair (preserves existing GoATAK install)"
+    info "Will not regenerate CA, stream TLS certs, devices, accounts or database."
+    # Extract an existing stream certificate's first DNS SAN as a helpful default.
+    local guessed host_default
+    guessed=$(root python3 - "$CONF" <<'PYHOST'
+import re,sys
+from pathlib import Path
+try:
+    text=Path(sys.argv[1]).read_text()
+    match=re.search(r'^\s+cert:\s*["\']?([^\s"\']+)', text, re.M)
+    print(match.group(1) if match else '')
+except (OSError, ValueError):
+    print('')
+PYHOST
+)
+    host_default="$(hostname -f 2>/dev/null || hostname)"
+    if [[ -n $guessed ]] && root test -f "$guessed"; then
+        local dns
+        dns=$(root openssl x509 -in "$guessed" -noout -ext subjectAltName 2>/dev/null | sed -n 's/.*DNS:\([^, ]*\).*/\1/p' | head -n 1) || true
+        [[ -n $dns ]] && host_default="$dns"
+    fi
+    ask HOST "Existing public server hostname" "$host_default"
+    [[ $HOST =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]] || die "invalid hostname"
+    choose_enrollment
+    if [[ $ENROLL_MODE == direct ]]; then
+        info "Leaving direct-GoATAK enrollment unchanged; no changes made."
+        return 0
+    fi
+    make_proxy_files
+    if [[ $ENROLL_MODE == local ]]; then
+        if ! local_cert_ready; then
+            warn "No changes were made to GoATAK. Fix local Nginx/certificate, then rerun."
+            info "Instructions: $PROXY_OUTPUT/README.txt"
+            return 0
+        fi
+        if ! ask_yn "Install local Nginx site AND switch GoATAK enrollment to 127.0.0.1:8447?" y; then
+            info "Nothing modified on GoATAK; generated files are ready."
+            return 0
+        fi
+        install_local_site
+    else
+        warn "Deploy remote Nginx first; until then the proxy will return 502."
+        info "Remote instructions: $PROXY_OUTPUT/README.txt"
+        if ! ask_yn "Remote proxy ready? Switch GoATAK backend NOW to $ENROLL_ADDR?" n; then
+            info "No GoATAK settings changed. Rerun after deploying Nginx."
+            return 0
+        fi
+    fi
+    backup_conf
+    if ! patch_enrollment_config; then
+        [[ $ENROLL_MODE == local ]] && rollback_local_site
+        die "could not update $CONF; original preserved in $BACKUP_CONF"
+    fi
+    if ! restart_running_goatak || ! wait_for_goatak; then
+        warn "GoATAK restart/port check failed; restoring previous config"
+        root cp -p "$BACKUP_CONF" "$CONF"
+        restart_running_goatak || warn "automatic recovery failed; inspect service logs"
+        [[ $ENROLL_MODE == local ]] && rollback_local_site
+        die "GoATAK restart failed; rolled back config"
+    fi
+    if [[ $ENROLL_MODE == local ]]; then
+        local nginx_ok=0
+        if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
+            if root systemctl is-active --quiet nginx; then
+                root systemctl reload nginx && nginx_ok=1
+            else
+                root systemctl start nginx && nginx_ok=1
+            fi
+        elif command -v sv >/dev/null; then
+            root sv restart nginx && nginx_ok=1
+        fi
+        if (( ! nginx_ok )); then
+            warn "Nginx could not start/reload; restoring original GoATAK enrollment"
+            root cp -p "$BACKUP_CONF" "$CONF"
+            restart_running_goatak || warn "manual restart required"
+            rollback_local_site
+            die "reverted changes due to Nginx failure"
+        fi
+    fi
+    ok "GoATAK cert_addr now: $ENROLL_ADDR"
+    info "Streaming :8089, client certs, DB and user accounts were not altered."
+    info "Check: sudo ss -lntp | grep -E ':(8089|8446|8447)\\b'"
+    info "Test from a reachable host using OpenSSL WITHOUT -CAfile (instructions in README)."
+    [[ $ENROLL_MODE == remote ]] && warn "Set VPN firewall: allow TCP $PROXY_IP:8447 ONLY from $PROXY_PEER; no WAN forward."
+    info "If iOS still rejects :8089, import the GoATAK CA via OmniTAK's built-in truststore/connection package."
+}
+
 # --- preflight -----------------------------------------------------------------
 [[ $EUID -ne 0 ]] || die "run this as your normal user, not root - it calls sudo itself"
 [[ -x $BIN ]] || die "$BIN not found - install the goatak package first"
 [[ -d $PKG_CERT ]] || die "$PKG_CERT not found - is the goatak package installed?"
-for cmd in openssl curl ss sed mktemp; do
+for cmd in openssl curl ss sed mktemp python3; do
     command -v "$cmd" >/dev/null || die "missing command: $cmd"
 done
 command -v zip >/dev/null || die "missing command: zip (pacman -S zip)"
@@ -187,6 +582,11 @@ else
 fi
 ok "ok"
 
+if [[ $MODE_ARG == --enrollment-only ]] || { [[ $MODE_ARG != --full ]] && root test -f "$CONF" && ask_yn "Existing GoATAK config found. Only repair HTTPS enrollment (recommended)?" y; }; then
+    run_enrollment_only
+    exit 0
+fi
+
 if ! id "$SVC_USER" >/dev/null 2>&1; then
     step "Creating system user $SVC_USER"
     if [[ -f /usr/lib/sysusers.d/goatak.conf ]] && command -v systemd-sysusers >/dev/null; then
@@ -209,6 +609,8 @@ ask EXTRA_SANS "Extra names/IPs for the certificate, space separated (optional)"
 for n in $EXTRA_SANS; do
     [[ $n =~ ^[A-Za-z0-9.:-]+$ ]] || die "invalid name/IP: $n"
 done
+
+choose_enrollment
 
 step "Certificate storage"
 ask CERT_DIR "Directory for CA and server certificates" "$STATE/cert/files"
@@ -234,11 +636,11 @@ if root test -f "$CERT_DIR/$HOST.pem" && root test -f "$CERT_DIR/$HOST.key"; the
         lifetime=$(( (not_after - not_before) / 86400 ))
         days_left=$(( (not_after - $(date +%s)) / 86400 ))
         if (( lifetime > SRV_DAYS )); then
-            warn "it is valid for $lifetime days; iOS rejects server certificates valid for more than $SRV_DAYS"
-            ask_yn "Renew it for $SRV_DAYS days with the same key? (enrolled devices keep working)" y && RENEW=1
+            warn "existing certificate lifetime: $lifetime days; some clients impose different limits"
+            ask_yn "Renew certificate with same key? (may affect clients; default NO)" n && RENEW=1
         elif (( days_left < 60 )); then
             warn "it expires in $days_left days"
-            ask_yn "Renew it for $SRV_DAYS days with the same key? (enrolled devices keep working)" y && RENEW=1
+            ask_yn "Renew certificate with same key? (may affect clients; default NO)" n && RENEW=1
         fi
     fi
 fi
@@ -309,7 +711,11 @@ fi
 OPEN_FW=0
 if [[ $FW != none ]]; then
     step "Firewall"
-    ask_yn "Open 8089, 8443 and 8446/tcp in $FW?" y && OPEN_FW=1
+    if [[ $ENROLL_MODE == remote ]]; then
+        ask_yn "Open 8089 and 8443/tcp in $FW? (8447 restricted manually)" n && OPEN_FW=1
+    else
+        ask_yn "Open 8089, 8443 and 8446/tcp in $FW? (VPN users may not need this)" n && OPEN_FW=1
+    fi
 fi
 
 # --- summary -------------------------------------------------------------------
@@ -323,7 +729,8 @@ info "connection zip:  $ZIP_DIR/${HOST}_connect.zip"
 info "config:          $CONF (existing file is backed up)"
 info "web GUI:         $ADMIN_ADDR"
 info "plain CoT 8999:  $([[ $PLAIN_TCP == '""' ]] && echo disabled || echo enabled)"
-info "TLS ports:       8089 (CoT), 8443 (API), 8446 (enrollment)"
+info "TLS ports:       8089 (CoT), 8443 (API), 8446 (enrollment via $ENROLL_MODE)"
+info "enrollment:      GoATAK $ENROLL_ADDR; Nginx $([[ $ENROLL_MODE == direct ]] && echo none || echo "$PROXY_OUTPUT")"
 if (( DO_ACCOUNTS )); then
     info "admin password:  $([[ -n $NEW_ADMIN_PW ]] && echo change || echo keep)"
     info "new users:       ${USERS[*]:-none}"
@@ -427,8 +834,8 @@ put_file 644 "$CONF" <<EOF
 admin_addr: "$ADMIN_ADDR"
 # Marti API, mutual TLS (ssl.marti)
 api_addr: ":8443"
-# certificate enrollment, TLS
-cert_addr: ":8446"
+# certificate enrollment: behind trusted HTTPS Nginx when proxy enabled
+cert_addr: "$ENROLL_ADDR"
 # unencrypted CoT ("" = disabled)
 tcp_addr: $PLAIN_TCP
 udp_addr: $PLAIN_UDP
@@ -594,6 +1001,32 @@ if [[ $INIT != none ]]; then
     fi
 fi
 
+if [[ $ENROLL_MODE != direct ]]; then
+    step "Nginx enrollment proxy"
+    make_proxy_files
+    if [[ $ENROLL_MODE == local ]]; then
+        if local_cert_ready; then
+            if ask_yn "Install this Nginx site and start/reload Nginx?" y; then
+                install_local_site
+                if [[ $INIT == systemd ]]; then
+                    if root systemctl is-active --quiet nginx; then
+                        root systemctl reload nginx || warn "Nginx reload failed; enrollment unavailable until fixed"
+                    else
+                        root systemctl start nginx || warn "Nginx start failed; enrollment unavailable until fixed"
+                    fi
+                else
+                    warn "Install/start Nginx via your init system; generated config is ready"
+                fi
+            fi
+        else
+            warn "GoATAK listens on localhost:8447 but Nginx is not ready. Install trusted certificate and rerun --enrollment-only."
+        fi
+    else
+        warn "Remote Nginx needs deployment; $PROXY_OUTPUT/README.txt has steps."
+        warn "Until deployed, Quick Connect enrollment may fail; stream :8089 remains separate."
+    fi
+fi
+
 step "ATAK connection package"
 in_dir "$CERT_DIR" cp -f ca.pem ca-trusted.pem
 in_dir "$CERT_DIR" rm -f "${HOST}_connect.zip"
@@ -608,26 +1041,31 @@ ok "$ZIP"
 
 if (( OPEN_FW )); then
     step "Firewall"
-    for p in 8089 8443 8446; do
+    FW_PORTS=(8089 8443)
+    [[ $ENROLL_MODE == remote ]] || FW_PORTS+=(8446)
+    for p in "${FW_PORTS[@]}"; do
         case $FW in
             ufw)       root ufw allow "$p/tcp" >/dev/null ;;
             firewalld) root firewall-cmd -q --permanent --add-port="$p/tcp" ;;
         esac
     done
     if [[ $FW == firewalld ]]; then root firewall-cmd -q --reload; fi
-    ok "opened 8089, 8443, 8446/tcp"
+    ok "opened ${FW_PORTS[*]}/tcp (not 8447)"
 fi
 
 step "Done"
 cat <<EOF
     Next steps:
       1. Back up $CERT_DIR/ca.key and ca.pem somewhere off this machine.
-      2. If the server is behind NAT, forward TCP 8089, 8443 and 8446 to it.
+      2. Keep WireGuard UDP forwarding unchanged. Make 8089 reachable by TAK clients;
+         make 8446 reachable on the Nginx host if using a proxy. Never forward 8447
+         on your public router. Expose other API ports only if actually required.
       3. Copy $ZIP to each phone and import it in ATAK
          (menu -> Import). Log in with that person's username and password.
       4. Web GUI: $( [[ $ADMIN_ADDR == 127.* ]] \
             && echo "ssh -L 8088:localhost:8088 <you>@$HOST, then http://localhost:8088" \
             || echo "http://$HOST:8088" )  (user: admin)
       5. Remove someone: disable their account in the web GUI (Devices).
+      6. Enrollment HTTPS: $ENROLL_MODE${PROXY_OUTPUT:+; files $PROXY_OUTPUT/README.txt}
 ${LOGCMD:+    Logs: $LOGCMD}
 EOF
