@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# goatak-setup.sh - AUR GoATAK deployment + trusted HTTPS enrollment proxy
+# goatak-setup-v2.sh - AUR GoATAK deployment + trusted HTTPS enrollment proxy
 #
 # What it does:
 #   1. asks for hostname, passwords, users and a few options
@@ -141,7 +141,7 @@ case "$MODE_ARG" in
         cat <<'USAGE'
 Usage: bash goatak-setup.sh [--enrollment-only | --full]
   (default): existing installs offer safe enrollment-only migration
-  --enrollment-only  Change only cert_addr + optionally configure local Nginx
+  --enrollment-only  Change enrollment listener and ssl.enroll only
   --full             Run complete first-time GoATAK setup (overwrites config)
 HTTPS modes: local Nginx, Nginx on another server, or original direct mode.
 Never forward plaintext upstream port 8447 to the public internet.
@@ -212,6 +212,210 @@ choose_enrollment() {
     [[ $PROXY_CERT == /* && $PROXY_KEY == /* && $PROXY_CERT != *[[:space:]]* && $PROXY_KEY != *[[:space:]]* ]] || die "certificate paths must be absolute and have no whitespace"
 }
 
+# Standalone, copy/paste guide with explicit machine labels. Nothing here is
+# run on the VPS automatically. The user must deploy and verify the VPS config.
+make_remote_guide() {
+    cat >"$PROXY_OUTPUT/REMOTE-NGINX-SETUP.md" <<EOFGUIDE
+# Remote Nginx for GoATAK Quick Connect — $HOST
+
+**Run the installer on the GoATAK desktop, not on the VPS.** The installer
+**does not log into or modify the VPS**. It creates this guide and the Nginx
+site on the GoATAK desktop, then (only with confirmation) updates GoATAK.
+
+## Your network — write down these three endpoints
+
+| Endpoint | Host/port | Function |
+|---|---|---|
+| Public enrollment | \`$HOST:8446\` | HTTPS Nginx on VPS; public-trust certificate |
+| Backend enrollment | \`$PROXY_IP:8447\` | Plain HTTP on desktop, through private WireGuard/LAN only |
+| TAK stream | \`$HOST:8089\` | Existing encrypted GoATAK TCP stream (DO NOT CHANGE) |
+
+Your VPS's **private** WireGuard/LAN source IP: \`$PROXY_PEER\`.
+GoATAK desktop's **private** WireGuard/LAN IP: \`$PROXY_IP\`.
+
+Phones use **enrollment port 8446** and **stream port 8089**. Never enter 8447
+in OmniTAK. Do not expose 8447 on the public internet or copy GoATAK CA
+private keys to your VPS.
+
+## Step 1 — On your GoATAK desktop: copy the generated site to the VPS
+
+The file was generated at:
+
+\`$PROXY_OUTPUT/goatak-enrollment.conf\`
+
+Substitute your VPS SSH user. If SSH is available over WireGuard:
+
+\`\`\`bash
+scp "$PROXY_OUTPUT/goatak-enrollment.conf" VPS_USER@$PROXY_PEER:/tmp/goatak-enrollment.conf
+\`\`\`
+
+Or copy the file by any secure method. Only the **site configuration** goes
+to the VPS; the certificate paths in that file point to files **on the VPS**.
+
+## Step 2 — On your VPS: install the site, verify certificate paths
+
+The VPS must have a publicly trusted full-chain certificate for \`$HOST\`:
+
+\`\`\`text
+Certificate: $PROXY_CERT
+Private key: $PROXY_KEY
+\`\`\`
+
+Use the existing Let's Encrypt certificate if already installed on the VPS.
+The script does **not** issue or renew it. Check the paths in the .conf file.
+
+For Debian/Ubuntu/Arch Nginx using \`conf.d/*.conf\` **inside \`http {}\`**:
+
+\`\`\`bash
+sudo nginx -T 2>&1 | grep -E 'include .*conf.d|include .*sites-enabled'
+if sudo test -e /etc/nginx/conf.d/goatak-enrollment.conf; then
+  sudo cp -a /etc/nginx/conf.d/goatak-enrollment.conf "/etc/nginx/conf.d/goatak-enrollment.conf.bak.\$(date +%Y%m%d-%H%M%S)"
+fi
+sudo install -m 644 /tmp/goatak-enrollment.conf /etc/nginx/conf.d/goatak-enrollment.conf
+sudo nginx -t && sudo systemctl reload nginx
+sudo ss -lntp | grep ':8446'
+\`\`\`
+
+If your Nginx does NOT include that directory, use the included
+\`/etc/nginx/sites-enabled\` directory or another included \`http {}\` location.
+Do NOT place the site inside a \`stream {}\` block. Use the VPS's init manager
+rather than \`systemctl\` if different. If \`nginx -t\` fails, don't reload;
+correct the reported problem without touching existing websites.
+
+## Step 3 — On your VPS: remove **old 8446 DNAT**, if applicable
+
+This step is CRITICAL if the VPS previously forwarded public 8446 directly
+to GoATAK \`$PROXY_IP:8446\`. The new path is **public 8446 -> VPS Nginx**.
+The old DNAT will intercept incoming mobile traffic before Nginx receives it.
+
+Inspect first (read-only):
+
+\`\`\`bash
+sudo iptables -t nat -S | grep -- '--dport 8446' || true
+sudo nft list ruleset 2>/dev/null | grep -C 2 'dnat to $PROXY_IP:8446' || true
+sudo grep -RIn '8446' /etc/wireguard /etc/iptables /etc/systemd/system 2>/dev/null || true
+\`\`\`
+
+If \`/etc/wireguard/wg0.conf\` or another WireGuard profile contains a
+\`PostUp\`/\`PostDown\` command for this **specific** 8446 DNAT, back up
+that configuration and remove ONLY that command. Do not remove commands for
+8089, other services, or WireGuard itself. If the line contains multiple
+semicolon-separated commands, remove only the 8446 command.
+
+If the live firewall uses the **exact** IPv4 iptables rule below, delete all
+matching copies **without restarting WireGuard**:
+
+\`\`\`bash
+rule=(-p tcp -m tcp --dport 8446 -j DNAT --to-destination $PROXY_IP:8446)
+while sudo iptables -t nat -C PREROUTING "\${rule[@]}" 2>/dev/null; do
+  sudo iptables -t nat -D PREROUTING "\${rule[@]}"
+done
+\`\`\`
+
+Do not execute that deletion if your rule differs. Inspect the applicable
+chain, nftables rule and persistent firewall manager instead. The deletion
+above is for an exact-match iptables PREROUTING rule; it is NOT a general
+firewall cleanup tool. \`iptables-nft\` also shows rules under nftables.
+
+Verify there is no **public 8446 -> $PROXY_IP:8446** DNAT left:
+
+\`\`\`bash
+sudo iptables -t nat -S | grep 8446 || true
+sudo nft list ruleset 2>/dev/null | grep -C 2 'dnat to $PROXY_IP:8446' || true
+sudo ss -lntp | grep ':8446'
+\`\`\`
+
+Do not restart WireGuard just to apply this change. Make the persistent change
+so the DNAT will not return after a reboot. VPS provider/cloud firewalls must
+also allow **inbound TCP 8446 to Nginx**. Existing TCP 8089 forwarding remains.
+
+## Step 4 — On the desktop: enable the GoATAK HTTP enrollment backend
+
+Rerun \`bash goatak-setup-v2.sh --enrollment-only\` (or complete the running
+wizard) and select remote Nginx, then confirm the switch once the VPS site
+and old DNAT are ready.
+
+The script sets BOTH:
+
+\`\`\`yaml
+cert_addr: "$PROXY_IP:8447"
+ssl:
+  enroll: false
+\`\`\`
+
+\`ssl.enroll: false\` is ESSENTIAL: the backend behind Nginx speaks **HTTP**,
+not HTTPS. Without this, Nginx may return **HTTP 502**. The script preserves
+\`ssl.marti\`, \`ssl.ca\`, \`ssl.cert\`, \`ssl.key\`, account database, CA,
+client certificates, and TAK \`8089\`. It backs up GoATAK configuration before
+changing it. A restart briefly interrupts existing clients.
+
+Restrict the desktop's TCP 8447 so **only $PROXY_PEER** can reach
+\`$PROXY_IP:8447\`, preferably only from the WireGuard interface; do not
+WAN-forward 8447. Firewall syntax depends on the desktop's firewall system.
+
+## Step 5 — Verify the WHOLE path, in order
+
+**Run on VPS:** Verify the desktop's backend responds over HTTP:
+
+\`\`\`bash
+curl -sS --max-time 8 -o /dev/null -w 'Backend HTTP: %{http_code}\n' \
+  http://$PROXY_IP:8447/Marti/api/tls/config
+\`\`\`
+
+Expected: **any HTTP response** (often 401 without credentials) confirms
+connectivity. A status \`000\` means connection failure. Do not use \`-k\`.
+
+**Run on VPS:** Verify local Nginx can reach that backend and presents a
+trusted certificate:
+
+\`\`\`bash
+curl -sS --max-time 8 --resolve $HOST:8446:127.0.0.1 \
+  -o /dev/null -w 'Nginx HTTP: %{http_code}\nTLS: %{ssl_verify_result}\n' \
+  https://$HOST:8446/Marti/api/tls/config
+\`\`\`
+
+Expected: **TLS 0**, plus an HTTP response such as \`401\` (unauthenticated
+request) or another endpoint response. **HTTP 502** means upstream failure.
+
+**Run on phone using cellular or an independent network:** Open
+\`https://$HOST:8446/\` in Safari/Chrome. A 401/404 web response is OK;
+timeout/refused/certificate warning is not. Then test OmniTAK Quick Connect
+with **enrollment port 8446** and the correct account credentials.
+
+**If local Nginx passes but phones cannot reach it:** inspect old 8446 DNAT,
+VPS/cloud INPUT firewall, public IPv4/IPv6 DNS, and traffic with:
+
+\`\`\`bash
+sudo tcpdump -ni any 'tcp port 8446'
+\`\`\`
+
+Remember that Android hotspot sharing may not share a phone's VPN tunnel with
+tethered iPads. The public VPS endpoint should not require the phone to join
+WireGuard unless your own firewall is configured to restrict it.
+
+## Rollback / troubleshooting
+
+If Nginx returns 502: check \`ssl.enroll: false\`, GoATAK listener \`$PROXY_IP:8447\`,
+Nginx \`proxy_pass http://$PROXY_IP:8447;\`, and desktop firewall.
+
+If Android says **HTTP 401**, the endpoint was reached; check account
+credentials only if the **authenticated Quick Connect attempt** gets 401.
+A manual \`curl\` without credentials can normally get 401.
+
+If clients get connection refused: check active DNAT for old 8446, public
+firewall and Nginx listening with \`ss -lntp\`.
+
+To roll back, restore the latest pre-change copy of
+\`/etc/goatak/goatak_server.yml.bak.*\` on the **desktop**, restart GoATAK,
+AND restore the previous forwarding path on the VPS if you wish to return to
+direct GoATAK 8446. Do not restore outdated port-forward rules unless GoATAK
+is once again listening there. Back up current configs before rollback.
+
+**IMPORTANT:** This guide does not run any remote commands. No changes are made
+to your VPS until YOU copy and install the config and adjust the forwarding.
+EOFGUIDE
+}
+
 make_proxy_files() {
     [[ $ENROLL_MODE == direct ]] && return 0
     mkdir -p "$PROXY_OUTPUT"
@@ -246,6 +450,11 @@ Nginx installation: $ENROLL_MODE
 GoATAK enrollment backend: $ENROLL_ADDR (HTTP on port 8447)
 Public/phone-facing HTTPS: $HOST:8446 (Nginx)
 Encrypted TAK client stream: $HOST:8089 (GoATAK; unchanged)
+
+IMPORTANT FOR REMOTE NGINX: Read REMOTE-NGINX-SETUP.md first. It gives
+explicit DESKTOP vs VPS steps, secure copy commands, WireGuard PostUp/PostDown
+changes, how to remove the obsolete public :8446 DNAT, and end-to-end tests.
+In proxy modes, GoATAK MUST use ssl.enroll: false (HTTP backend :8447).
 
 1. Acquire a PUBLICLY TRUSTED TLS full chain and key for $HOST on the
    Nginx computer. The configured paths are:
@@ -286,6 +495,7 @@ $([[ $ENROLL_MODE == remote ]] && echo "- UFW example on GoATAK, assuming wg0: s
 - Do not expose GoATAK's admin HTTP API or enrollment HTTP backend publicly.
 EOFRD
     if [[ $ENROLL_MODE == remote ]]; then
+        make_remote_guide
         cat >"$PROXY_OUTPUT/OPTIONAL-stream-8089.conf" <<EOFSTREAM
 # OPTIONAL only when client DNS points to Nginx and :8089 needs forwarding.
 # This file belongs inside Nginx's STREAM context, NOT its HTTP context.
@@ -339,32 +549,74 @@ backup_conf() {
     ok "config backup: $BACKUP_CONF"
 }
 
-# Changes ONLY the top-level cert_addr line; every other setting is preserved.
+# Patch ONLY cert_addr and ssl.enroll. Plain HTTP upstream is required behind
+# trusted-HTTPS Nginx; all existing stream / CA settings are preserved.
 patch_enrollment_config() {
     root python3 - "$CONF" "$ENROLL_ADDR" <<'PYPATCH'
 from pathlib import Path
 import os, re, sys, tempfile
+
 path, addr = Path(sys.argv[1]), sys.argv[2]
-if not re.fullmatch(r'(?:(?:127\.0\.0\.1|[0-9]{1,3}(?:\.[0-9]{1,3}){3}):8447|:8446)',addr):
+if not re.fullmatch(r'(?:(?:127\.0\.0\.1|[0-9]{1,3}(?:\.[0-9]{1,3}){3}):8447)',addr):
     raise SystemExit('refusing unsafe cert_addr')
-src=path.read_text()
-pattern=re.compile(r'^(cert_addr\s*:\s*)([^\n]*)(\n?)$',re.M)
-items=list(pattern.finditer(src))
-if len(items)>1: raise SystemExit('multiple top-level cert_addr keys; manual review needed')
-if items:
-    a=items[0]
-    new=src[:a.start()]+a.group(1)+'"'+addr+'"'+a.group(3)+src[a.end():]
+
+src = path.read_text()
+lines = src.splitlines(keepends=True)
+# Do not accidentally mutate a YAML document with aliases, flow-style ssl
+# blocks, duplicate top-level keys or multiple documents.
+if re.search(r'^\s*---\s*$', src, re.M) and len(re.findall(r'^---\s*$', src, re.M)) > 1:
+    raise SystemExit('multiple YAML documents; manual review needed')
+
+def top_key(line, key):
+    return bool(re.match(r'^' + re.escape(key) + r'\s*:', line))
+
+cert_ids = [i for i, line in enumerate(lines) if top_key(line, 'cert_addr')]
+ssl_ids = [i for i, line in enumerate(lines) if top_key(line, 'ssl')]
+if len(cert_ids) > 1 or len(ssl_ids) > 1:
+    raise SystemExit('duplicate cert_addr or ssl sections; manual review needed')
+
+if cert_ids:
+    i = cert_ids[0]
+    prefix = re.match(r'^(cert_addr\s*:\s*)', lines[i]).group(1)
+    lines[i] = prefix + '"' + addr + '"\n'
 else:
-    new=src.rstrip('\n')+'\ncert_addr: "'+addr+'"\n'
-if new==src: sys.exit(0)
-st=os.stat(path)
-fd, name=tempfile.mkstemp(prefix='.goatak-',dir=str(path.parent))
+    lines.append('cert_addr: "' + addr + '"\n')
+
+if ssl_ids:
+    first = ssl_ids[0]
+    if not re.match(r'^ssl\s*:\s*(?:#.*)?$', lines[first].rstrip('\n')):
+        raise SystemExit('ssl section uses unsupported inline YAML; manual review needed')
+    end = first + 1
+    while end < len(lines):
+        line = lines[end]
+        if re.match(r'^[^\s#][^\n]*:', line) or re.match(r'^---\s*$', line):
+            break
+        end += 1
+    enroll_ids = [i for i in range(first+1, end)
+                  if re.match(r'^  enroll\s*:', lines[i])]
+    if len(enroll_ids) > 1:
+        raise SystemExit('duplicate ssl.enroll settings; manual review needed')
+    if enroll_ids:
+        i = enroll_ids[0]
+        lines[i] = re.match(r'^(\s*enroll\s*:\s*)', lines[i]).group(1) + 'false\n'
+    else:
+        lines.insert(end, '  enroll: false\n')
+else:
+    lines.append('\nssl:\n  enroll: false\n')
+
+new = ''.join(lines)
+if new == src:
+    sys.exit(0)
+st = os.stat(path)
+fd, name = tempfile.mkstemp(prefix='.goatak-', dir=str(path.parent))
 try:
     os.fchmod(fd, st.st_mode & 0o777)
-    os.fchown(fd,st.st_uid,st.st_gid)
-    with os.fdopen(fd,'w') as f:
-        f.write(new); f.flush(); os.fsync(f.fileno())
-    os.replace(name,path)
+    os.fchown(fd, st.st_uid, st.st_gid)
+    with os.fdopen(fd, 'w') as f:
+        f.write(new)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(name, path)
 except BaseException:
     try: os.unlink(name)
     except OSError: pass
@@ -372,6 +624,22 @@ except BaseException:
 PYPATCH
 }
 
+# If the system is already correctly configured (e.g. running again solely to
+# regenerate remote VPS notes), do not rewrite config or restart working TAK.
+enrollment_already_configured() {
+    root python3 - "$CONF" "$ENROLL_ADDR" <<'PYCHECK'
+from pathlib import Path
+import re,sys
+text=Path(sys.argv[1]).read_text()
+addr=sys.argv[2]
+cert=re.search(r'^cert_addr\s*:\s*["\']?([^\n"\' #]+)',text,re.M)
+ssl=re.search(r'^ssl\s*:\s*(?:#.*)?\n((?:^[ \t]+.*\n|^\s*\n|^#.*\n)*)',text,re.M)
+if not cert or cert.group(1) != addr or not ssl:
+    sys.exit(1)
+if not re.search(r'^  enroll\s*:\s*false\b',ssl.group(1),re.M):
+    sys.exit(1)
+PYCHECK
+}
 restart_running_goatak() {
     if [[ -d /run/systemd/system ]] && command -v systemctl >/dev/null; then
         root systemctl restart goatak.service && root systemctl is-active --quiet goatak.service
@@ -467,10 +735,22 @@ PYHOST
         fi
         install_local_site
     else
-        warn "Deploy remote Nginx first; until then the proxy will return 502."
-        info "Remote instructions: $PROXY_OUTPUT/README.txt"
-        if ! ask_yn "Remote proxy ready? Switch GoATAK backend NOW to $ENROLL_ADDR?" n; then
-            info "No GoATAK settings changed. Rerun after deploying Nginx."
+        if enrollment_already_configured; then
+            ok "GoATAK already uses HTTP enrollment $ENROLL_ADDR (ssl.enroll=false)"
+            info "Generated updated VPS site and instructions: $PROXY_OUTPUT/REMOTE-NGINX-SETUP.md"
+            info "No GoATAK config change or service restart was needed."
+            return 0
+        fi
+        step "Remote VPS deployment — required before changing GoATAK"
+        info "Detailed guide: $PROXY_OUTPUT/REMOTE-NGINX-SETUP.md"
+        info "1. DESKTOP: scp '$PROXY_OUTPUT/goatak-enrollment.conf' VPS_USER@$PROXY_PEER:/tmp/"
+        info "2. VPS: install into included nginx http{} directory; nginx -t && reload."
+        info "3. VPS: REMOVE OLD DNAT public :8446 -> $PROXY_IP:8446 from live firewall"
+        info "   AND persistent WireGuard PostUp/PostDown (if present). Keep :8089 forwarding!"
+        info "4. VPS: check nginx listening :8446. GoATAK switch below enables HTTP backend."
+        warn "The VPS was NOT changed by this script. Never public-forward :8447."
+        if ! ask_yn "VPS Nginx installed AND obsolete 8446 DNAT removed? Switch GoATAK backend NOW?" n; then
+            info "No GoATAK settings changed. Read remote guide and rerun when ready."
             return 0
         fi
     fi
@@ -505,7 +785,7 @@ PYHOST
             die "reverted changes due to Nginx failure"
         fi
     fi
-    ok "GoATAK cert_addr now: $ENROLL_ADDR"
+    ok "GoATAK cert_addr now: $ENROLL_ADDR (ssl.enroll: false — HTTP backend)"
     info "Streaming :8089, client certs, DB and user accounts were not altered."
     info "Check: sudo ss -lntp | grep -E ':(8089|8446|8447)\\b'"
     info "Test from a reachable host using OpenSSL WITHOUT -CAfile (instructions in README)."
@@ -867,7 +1147,7 @@ ssl:
   cert: $CERT_DIR/$HOST.pem
   key: $CERT_DIR/$HOST.key
   marti: true
-  enroll: true
+  enroll: $([[ $ENROLL_MODE == direct ]] && echo true || echo false)
   cert_ttl_days: 365
 EOF
 ok "$CONF"
@@ -1022,8 +1302,9 @@ if [[ $ENROLL_MODE != direct ]]; then
             warn "GoATAK listens on localhost:8447 but Nginx is not ready. Install trusted certificate and rerun --enrollment-only."
         fi
     else
-        warn "Remote Nginx needs deployment; $PROXY_OUTPUT/README.txt has steps."
-        warn "Until deployed, Quick Connect enrollment may fail; stream :8089 remains separate."
+        warn "Remote Nginx must be installed and old 8446 DNAT removed on the VPS."
+        info "FULL VPS RUNBOOK: $PROXY_OUTPUT/REMOTE-NGINX-SETUP.md"
+        info "Script does not connect to or alter the VPS. Keep :8089 routing unchanged."
     fi
 fi
 
